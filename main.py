@@ -53,7 +53,7 @@ Respondé con este JSON exacto:
             "content-type": "application/json"
         },
         json={
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-haiku-4-5",
             "max_tokens": 500,
             "messages": [{"role": "user", "content": prompt}]
         },
