@@ -1,9 +1,8 @@
 from flask import Flask, request, jsonify
-import requests, os, json, time
+import requests, os, json
 from datetime import datetime
 import pandas as pd
 import pandas_ta as ta
-from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -11,7 +10,6 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 
-# Temporalidades que vamos a analizar
 TIMEFRAMES = {
     "5m": "5m",
     "15m": "15m",
@@ -21,12 +19,10 @@ TIMEFRAMES = {
     "1d": "1d"
 }
 
-# Umbral mínimo de confianza para publicar señal
 UMBRAL_CONFIANZA = 70
 
 
 def get_binance_klines(interval, limit=200):
-    """Pide velas de Binance para BTCUSDT"""
     url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
     try:
         r = requests.get(url, timeout=10)
@@ -45,29 +41,21 @@ def get_binance_klines(interval, limit=200):
 
 
 def calculate_indicators(df):
-    """Calcula RSI, EMAs, MACD, Volumen para un dataframe de velas"""
     if df is None or len(df) < 50:
         return None
-    
-    # RSI 14
+
     df["rsi"] = ta.rsi(df["close"], length=14)
-    
-    # EMAs
     df["ema_20"] = ta.ema(df["close"], length=20)
     df["ema_50"] = ta.ema(df["close"], length=50)
     df["ema_200"] = ta.ema(df["close"], length=200)
-    
-    # MACD
     macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
     if macd is not None:
         df["macd"] = macd["MACD_12_26_9"]
         df["macd_signal"] = macd["MACDs_12_26_9"]
-        df["macd_hist"] = macd["MACDh_12_26_9"]
-    
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    
-    # Tendencia EMA
+
     if last["close"] > last["ema_20"] > last["ema_50"]:
         ema_trend = "alcista_fuerte"
     elif last["close"] > last["ema_50"]:
@@ -78,9 +66,8 @@ def calculate_indicators(df):
         ema_trend = "bajista"
     else:
         ema_trend = "lateral"
-    
-    # MACD signal
-    if last.get("macd") and last.get("macd_signal"):
+
+    if pd.notna(last.get("macd")) and pd.notna(last.get("macd_signal")):
         if last["macd"] > last["macd_signal"] and prev["macd"] <= prev["macd_signal"]:
             macd_state = "cruce_alcista_reciente"
         elif last["macd"] < last["macd_signal"] and prev["macd"] >= prev["macd_signal"]:
@@ -91,11 +78,10 @@ def calculate_indicators(df):
             macd_state = "bajista"
     else:
         macd_state = "n/d"
-    
-    # Volumen relativo
+
     avg_volume = df["volume"].tail(20).mean()
     vol_relative = last["volume"] / avg_volume if avg_volume > 0 else 1
-    
+
     return {
         "precio": round(last["close"], 2),
         "rsi": round(last["rsi"], 2) if pd.notna(last["rsi"]) else None,
@@ -109,21 +95,18 @@ def calculate_indicators(df):
 
 
 def get_binance_funding():
-    """Pide funding rate de Binance Futures"""
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=10)
         data = r.json()
         return {
             "mark_price": float(data["markPrice"]),
-            "funding_rate": float(data["lastFundingRate"]) * 100,
-            "next_funding_time": data["nextFundingTime"]
+            "funding_rate": float(data["lastFundingRate"]) * 100
         }
     except Exception as e:
         return {"error": str(e)}
 
 
 def get_binance_open_interest():
-    """Pide Open Interest de Binance Futures"""
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=10)
         data = r.json()
@@ -133,24 +116,19 @@ def get_binance_open_interest():
 
 
 def collect_all_data():
-    """Recolecta datos de todas las temporalidades + funding + OI"""
     market_data = {"temporalidades": {}}
-    
     for name, interval in TIMEFRAMES.items():
         df = get_binance_klines(interval)
         indicators = calculate_indicators(df)
         if indicators:
             market_data["temporalidades"][name] = indicators
-    
     market_data["funding"] = get_binance_funding()
     market_data["open_interest"] = get_binance_open_interest()
     market_data["timestamp"] = str(datetime.now())
-    
     return market_data
 
 
 def analyze_with_claude(market_data, contexto_extra=""):
-    """Manda los datos a Claude para análisis"""
     prompt = f"""Sos un analista experto en trading de futuros de Bitcoin (BTC/USDT).
 
 Analizá los siguientes datos REALES del mercado y decidí si hay una señal clara de LONG o SHORT.
@@ -158,9 +136,7 @@ Analizá los siguientes datos REALES del mercado y decidí si hay una señal cla
 DATOS DEL MERCADO (Binance):
 {json.dumps(market_data, indent=2, ensure_ascii=False)}
 
-{f'CONTEXTO ADICIONAL (TradingView): {contexto_extra}' if contexto_extra else ''}
-
-CRITERIOS PARA SEÑAL:
+{f'CONTEXTO ADICIONAL: {contexto_extra}' if contexto_extra else ''}
 
 LONG cuando hay confluencia de:
 - RSI < 35 en al menos 2 temporalidades
@@ -189,7 +165,7 @@ Respondé SOLO con este JSON exacto:
   "apalancamiento": número entre 2 y 10,
   "razon": "explicación breve de la confluencia detectada"
 }}"""
-    
+
     try:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -205,30 +181,19 @@ Respondé SOLO con este JSON exacto:
             },
             timeout=30
         )
-        
         data = response.json()
-        
         if "content" not in data:
-            return {
-                "señal": "NEUTRAL",
-                "confianza": 0,
-                "razon": f"Error Anthropic: {json.dumps(data)[:200]}"
-            }
-        
+            return {"señal": "NEUTRAL", "confianza": 0, "razon": f"Error Anthropic: {json.dumps(data)[:200]}"}
         text = data["content"][0]["text"]
         return json.loads(text.replace("```json", "").replace("```", "").strip())
-    
     except Exception as e:
         return {"señal": "NEUTRAL", "confianza": 0, "razon": f"Error: {str(e)}"}
 
 
 def send_telegram(signal, contexto=""):
-    """Publica la señal en Telegram si supera el umbral"""
     if signal.get("señal") == "NEUTRAL" or signal.get("confianza", 0) < UMBRAL_CONFIANZA:
         return {"sent": False, "reason": f"Señal {signal.get('señal')} con confianza {signal.get('confianza')}%"}
-    
     emoji = "🟢" if signal["señal"] == "LONG" else "🔴"
-    
     msg = f"""{emoji} *SEÑAL BTC/USDT — {signal['señal']}*
 
 💰 Entrada: `{signal.get('entrada', 'N/A')}`
@@ -242,7 +207,6 @@ def send_telegram(signal, contexto=""):
 {f'{chr(10)}🔔 Trigger: {contexto}' if contexto else ''}
 
 ⚠️ _Gestioná siempre tu riesgo._"""
-    
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -255,16 +219,11 @@ def send_telegram(signal, contexto=""):
 
 
 def run_analysis(contexto_extra=""):
-    """Función completa: recolecta datos → analiza → publica"""
-    print(f"[{datetime.now()}] Iniciando análisis...")
     market_data = collect_all_data()
     signal = analyze_with_claude(market_data, contexto_extra)
     tg_result = send_telegram(signal, contexto_extra)
-    print(f"[{datetime.now()}] Análisis completado. Señal: {signal.get('señal')} - Confianza: {signal.get('confianza')}%")
     return {"market_data": market_data, "signal": signal, "telegram": tg_result}
 
-
-# ===== ENDPOINTS =====
 
 @app.route("/")
 def health():
@@ -273,14 +232,12 @@ def health():
 
 @app.route("/analyze")
 def analyze_endpoint():
-    """Trigger manual para correr análisis ahora"""
     result = run_analysis()
     return jsonify(result)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Recibe alertas de TradingView"""
     try:
         tv_data = request.json or {}
         contexto = json.dumps(tv_data)
@@ -292,7 +249,6 @@ def webhook():
 
 @app.route("/test-telegram")
 def test_telegram():
-    """Test simple de Telegram"""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -310,16 +266,8 @@ def test_telegram():
 
 @app.route("/market-data")
 def market_data_endpoint():
-    """Ver los datos del mercado sin analizar (debug)"""
     data = collect_all_data()
     return jsonify(data)
-
-
-# ===== SCHEDULER AUTOMÁTICO =====
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(run_analysis, "interval", hours=1, id="hourly_analysis")
-scheduler.start()
 
 
 if __name__ == "__main__":
