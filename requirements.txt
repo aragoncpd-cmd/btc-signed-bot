@@ -4,4 +4,3 @@ gunicorn
 pandas
 numpy
 pandas-ta
-apscheduler
