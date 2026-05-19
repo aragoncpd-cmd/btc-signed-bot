@@ -1,39 +1,184 @@
 from flask import Flask, request, jsonify
-import requests, os, json
+import requests, os, json, time
 from datetime import datetime
+import pandas as pd
+import pandas_ta as ta
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-COINGLASS_KEY = os.environ.get("COINGLASS_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 
-def get_coinglass_data():
-    headers = {"CG-API-KEY": COINGLASS_KEY}
-    data = {}
+# Temporalidades que vamos a analizar
+TIMEFRAMES = {
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1d"
+}
+
+# Umbral mínimo de confianza para publicar señal
+UMBRAL_CONFIANZA = 70
+
+
+def get_binance_klines(interval, limit=200):
+    """Pide velas de Binance para BTCUSDT"""
+    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
     try:
-        oi_r = requests.get("https://open-api-v4.coinglass.com/api/futures/open-interest/aggregated-history?symbol=BTC&interval=4h&limit=10", headers=headers, timeout=10)
-        data["oi"] = oi_r.json()
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
+        ])
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        return df
     except Exception as e:
-        data["oi_error"] = str(e)
+        return None
+
+
+def calculate_indicators(df):
+    """Calcula RSI, EMAs, MACD, Volumen para un dataframe de velas"""
+    if df is None or len(df) < 50:
+        return None
+    
+    # RSI 14
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    
+    # EMAs
+    df["ema_20"] = ta.ema(df["close"], length=20)
+    df["ema_50"] = ta.ema(df["close"], length=50)
+    df["ema_200"] = ta.ema(df["close"], length=200)
+    
+    # MACD
+    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
+    if macd is not None:
+        df["macd"] = macd["MACD_12_26_9"]
+        df["macd_signal"] = macd["MACDs_12_26_9"]
+        df["macd_hist"] = macd["MACDh_12_26_9"]
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # Tendencia EMA
+    if last["close"] > last["ema_20"] > last["ema_50"]:
+        ema_trend = "alcista_fuerte"
+    elif last["close"] > last["ema_50"]:
+        ema_trend = "alcista"
+    elif last["close"] < last["ema_20"] < last["ema_50"]:
+        ema_trend = "bajista_fuerte"
+    elif last["close"] < last["ema_50"]:
+        ema_trend = "bajista"
+    else:
+        ema_trend = "lateral"
+    
+    # MACD signal
+    if last.get("macd") and last.get("macd_signal"):
+        if last["macd"] > last["macd_signal"] and prev["macd"] <= prev["macd_signal"]:
+            macd_state = "cruce_alcista_reciente"
+        elif last["macd"] < last["macd_signal"] and prev["macd"] >= prev["macd_signal"]:
+            macd_state = "cruce_bajista_reciente"
+        elif last["macd"] > last["macd_signal"]:
+            macd_state = "alcista"
+        else:
+            macd_state = "bajista"
+    else:
+        macd_state = "n/d"
+    
+    # Volumen relativo
+    avg_volume = df["volume"].tail(20).mean()
+    vol_relative = last["volume"] / avg_volume if avg_volume > 0 else 1
+    
+    return {
+        "precio": round(last["close"], 2),
+        "rsi": round(last["rsi"], 2) if pd.notna(last["rsi"]) else None,
+        "ema_20": round(last["ema_20"], 2) if pd.notna(last["ema_20"]) else None,
+        "ema_50": round(last["ema_50"], 2) if pd.notna(last["ema_50"]) else None,
+        "ema_200": round(last["ema_200"], 2) if pd.notna(last["ema_200"]) else None,
+        "ema_trend": ema_trend,
+        "macd_state": macd_state,
+        "volumen_relativo": round(vol_relative, 2)
+    }
+
+
+def get_binance_funding():
+    """Pide funding rate de Binance Futures"""
     try:
-        f_r = requests.get("https://open-api-v4.coinglass.com/api/futures/funding-rate/history?symbol=BTC&exchange=Binance&interval=4h&limit=10", headers=headers, timeout=10)
-        data["funding"] = f_r.json()
+        r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=10)
+        data = r.json()
+        return {
+            "mark_price": float(data["markPrice"]),
+            "funding_rate": float(data["lastFundingRate"]) * 100,
+            "next_funding_time": data["nextFundingTime"]
+        }
     except Exception as e:
-        data["funding_error"] = str(e)
-    return data
+        return {"error": str(e)}
 
-def analyze_with_claude(tv_data, cg_data):
-    prompt = f"""Analizá este estado del mercado BTC/USDT Futuros y respondé SOLO en JSON válido sin texto adicional.
 
-DATOS TRADINGVIEW:
-{json.dumps(tv_data, indent=2, ensure_ascii=False)}
+def get_binance_open_interest():
+    """Pide Open Interest de Binance Futures"""
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=10)
+        data = r.json()
+        return {"open_interest": float(data["openInterest"])}
+    except Exception as e:
+        return {"error": str(e)}
 
-DATOS COINGLASS:
-{json.dumps(cg_data, indent=2, ensure_ascii=False)[:3000]}
 
-Respondé con este JSON exacto:
+def collect_all_data():
+    """Recolecta datos de todas las temporalidades + funding + OI"""
+    market_data = {"temporalidades": {}}
+    
+    for name, interval in TIMEFRAMES.items():
+        df = get_binance_klines(interval)
+        indicators = calculate_indicators(df)
+        if indicators:
+            market_data["temporalidades"][name] = indicators
+    
+    market_data["funding"] = get_binance_funding()
+    market_data["open_interest"] = get_binance_open_interest()
+    market_data["timestamp"] = str(datetime.now())
+    
+    return market_data
+
+
+def analyze_with_claude(market_data, contexto_extra=""):
+    """Manda los datos a Claude para análisis"""
+    prompt = f"""Sos un analista experto en trading de futuros de Bitcoin (BTC/USDT).
+
+Analizá los siguientes datos REALES del mercado y decidí si hay una señal clara de LONG o SHORT.
+
+DATOS DEL MERCADO (Binance):
+{json.dumps(market_data, indent=2, ensure_ascii=False)}
+
+{f'CONTEXTO ADICIONAL (TradingView): {contexto_extra}' if contexto_extra else ''}
+
+CRITERIOS PARA SEÑAL:
+
+LONG cuando hay confluencia de:
+- RSI < 35 en al menos 2 temporalidades
+- Tendencia EMA alcista en 4h o 1d
+- MACD cruce alcista o estado alcista
+- Funding negativo o cercano a 0
+- Volumen relativo > 1
+
+SHORT cuando hay confluencia de:
+- RSI > 65 en al menos 2 temporalidades
+- Tendencia EMA bajista en 4h o 1d
+- MACD cruce bajista o estado bajista
+- Funding muy positivo (> 0.05%)
+- Volumen relativo > 1
+
+NEUTRAL cuando no hay confluencia clara.
+
+Respondé SOLO con este JSON exacto:
 {{
   "señal": "LONG" o "SHORT" o "NEUTRAL",
   "confianza": número 1-100,
@@ -41,97 +186,113 @@ Respondé con este JSON exacto:
   "tp1": "precio",
   "tp2": "precio",
   "sl": "precio",
-  "apalancamiento": número,
-  "razon": "explicación breve"
+  "apalancamiento": número entre 2 y 10,
+  "razon": "explicación breve de la confluencia detectada"
 }}"""
-
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        },
-        json={
-            "model": "claude-haiku-4-5",
-            "max_tokens": 500,
-            "messages": [{"role": "user", "content": prompt}]
-        },
-        timeout=30
-    )
     
-    response_data = response.json()
-    
-    # Si la respuesta no tiene "content", devolvemos el error de Anthropic
-    if "content" not in response_data:
-        return {
-            "señal": "NEUTRAL",
-            "confianza": 0,
-            "entrada": "N/A",
-            "tp1": "N/A",
-            "tp2": "N/A",
-            "sl": "N/A",
-            "apalancamiento": 1,
-            "razon": f"Error de Anthropic: {json.dumps(response_data)[:300]}"
-        }
-    
-    text = response_data["content"][0]["text"]
     try:
-        return json.loads(text.replace("```json","").replace("```","").strip())
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 800,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        
+        data = response.json()
+        
+        if "content" not in data:
+            return {
+                "señal": "NEUTRAL",
+                "confianza": 0,
+                "razon": f"Error Anthropic: {json.dumps(data)[:200]}"
+            }
+        
+        text = data["content"][0]["text"]
+        return json.loads(text.replace("```json", "").replace("```", "").strip())
+    
     except Exception as e:
-        return {
-            "señal": "NEUTRAL",
-            "confianza": 0,
-            "entrada": "N/A",
-            "tp1": "N/A",
-            "tp2": "N/A",
-            "sl": "N/A",
-            "apalancamiento": 1,
-            "razon": f"No se pudo parsear respuesta IA: {text[:200]}"
-        }
+        return {"señal": "NEUTRAL", "confianza": 0, "razon": f"Error: {str(e)}"}
 
-def send_telegram(signal):
-    if signal["señal"] == "NEUTRAL" or signal["confianza"] < 65:
-        return {"sent": False, "reason": "Señal NEUTRAL o confianza baja"}
+
+def send_telegram(signal, contexto=""):
+    """Publica la señal en Telegram si supera el umbral"""
+    if signal.get("señal") == "NEUTRAL" or signal.get("confianza", 0) < UMBRAL_CONFIANZA:
+        return {"sent": False, "reason": f"Señal {signal.get('señal')} con confianza {signal.get('confianza')}%"}
+    
     emoji = "🟢" if signal["señal"] == "LONG" else "🔴"
+    
     msg = f"""{emoji} *SEÑAL BTC/USDT — {signal['señal']}*
 
-💰 Entrada: `{signal['entrada']}`
-🎯 TP1: `{signal['tp1']}`
-🎯 TP2: `{signal['tp2']}`
-🛑 SL: `{signal['sl']}`
-⚡ Apalancamiento: `{signal['apalancamiento']}x`
-📊 Confianza: `{signal['confianza']}%`
+💰 Entrada: `{signal.get('entrada', 'N/A')}`
+🎯 TP1: `{signal.get('tp1', 'N/A')}`
+🎯 TP2: `{signal.get('tp2', 'N/A')}`
+🛑 SL: `{signal.get('sl', 'N/A')}`
+⚡ Apalancamiento: `{signal.get('apalancamiento', 'N/A')}x`
+📊 Confianza: `{signal.get('confianza')}%`
 
-📝 {signal['razon']}
+📝 {signal.get('razon', '')}
+{f'{chr(10)}🔔 Trigger: {contexto}' if contexto else ''}
 
 ⚠️ _Gestioná siempre tu riesgo._"""
+    
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        )
+        return {"sent": True, "telegram": r.json()}
+    except Exception as e:
+        return {"sent": False, "error": str(e)}
 
-    r = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-        timeout=10
-    )
-    return {"sent": True, "telegram_response": r.json()}
+
+def run_analysis(contexto_extra=""):
+    """Función completa: recolecta datos → analiza → publica"""
+    print(f"[{datetime.now()}] Iniciando análisis...")
+    market_data = collect_all_data()
+    signal = analyze_with_claude(market_data, contexto_extra)
+    tg_result = send_telegram(signal, contexto_extra)
+    print(f"[{datetime.now()}] Análisis completado. Señal: {signal.get('señal')} - Confianza: {signal.get('confianza')}%")
+    return {"market_data": market_data, "signal": signal, "telegram": tg_result}
+
+
+# ===== ENDPOINTS =====
+
+@app.route("/")
+def health():
+    return jsonify({"status": "BTC Signal Bot v2 corriendo", "time": str(datetime.now())})
+
+
+@app.route("/analyze")
+def analyze_endpoint():
+    """Trigger manual para correr análisis ahora"""
+    result = run_analysis()
+    return jsonify(result)
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """Recibe alertas de TradingView"""
     try:
         tv_data = request.json or {}
-        cg_data = get_coinglass_data()
-        signal = analyze_with_claude(tv_data, cg_data)
-        tg_result = send_telegram(signal)
-        return jsonify({
-            "status": "ok",
-            "signal": signal,
-            "telegram": tg_result
-        })
+        contexto = json.dumps(tv_data)
+        result = run_analysis(contexto_extra=contexto)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
+
 @app.route("/test-telegram")
 def test_telegram():
-    """Endpoint para probar solo Telegram sin IA ni Coinglass"""
+    """Test simple de Telegram"""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -146,9 +307,20 @@ def test_telegram():
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
-@app.route("/")
-def health():
-    return jsonify({"status": "BTC Signal Bot corriendo", "time": str(datetime.now())})
+
+@app.route("/market-data")
+def market_data_endpoint():
+    """Ver los datos del mercado sin analizar (debug)"""
+    data = collect_all_data()
+    return jsonify(data)
+
+
+# ===== SCHEDULER AUTOMÁTICO =====
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(run_analysis, "interval", hours=1, id="hourly_analysis")
+scheduler.start()
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
