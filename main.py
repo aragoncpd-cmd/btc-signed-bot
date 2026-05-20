@@ -10,26 +10,32 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 
+# Mapeo de temporalidades a formato Bybit
 TIMEFRAMES = {
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1d"
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "4h": "240",
+    "1d": "D"
 }
 
 UMBRAL_CONFIANZA = 70
 
 
-def get_binance_klines(interval, limit=200):
-    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
+def get_bybit_klines(interval, limit=200):
+    """Pide velas de Bybit para BTCUSDT perpetual"""
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval={interval}&limit={limit}"
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
+        if data.get("retCode") != 0:
+            return None
+        klines = data["result"]["list"]
+        # Bybit devuelve las velas en orden inverso (más reciente primero)
+        klines.reverse()
+        df = pd.DataFrame(klines, columns=[
+            "open_time", "open", "high", "low", "close", "volume", "turnover"
         ])
         df["close"] = df["close"].astype(float)
         df["high"] = df["high"].astype(float)
@@ -94,23 +100,21 @@ def calculate_indicators(df):
     }
 
 
-def get_binance_funding():
+def get_bybit_funding():
+    """Pide funding rate de Bybit Futures"""
     try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", timeout=10)
         data = r.json()
+        if data.get("retCode") != 0:
+            return {"error": "API Bybit error"}
+        ticker = data["result"]["list"][0]
         return {
-            "mark_price": float(data["markPrice"]),
-            "funding_rate": float(data["lastFundingRate"]) * 100
+            "mark_price": float(ticker["markPrice"]),
+            "funding_rate": float(ticker["fundingRate"]) * 100,
+            "open_interest": float(ticker["openInterest"]),
+            "volume_24h": float(ticker["volume24h"]),
+            "price_change_24h_pct": float(ticker["price24hPcnt"]) * 100
         }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_binance_open_interest():
-    try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=10)
-        data = r.json()
-        return {"open_interest": float(data["openInterest"])}
     except Exception as e:
         return {"error": str(e)}
 
@@ -118,12 +122,11 @@ def get_binance_open_interest():
 def collect_all_data():
     market_data = {"temporalidades": {}}
     for name, interval in TIMEFRAMES.items():
-        df = get_binance_klines(interval)
+        df = get_bybit_klines(interval)
         indicators = calculate_indicators(df)
         if indicators:
             market_data["temporalidades"][name] = indicators
-    market_data["funding"] = get_binance_funding()
-    market_data["open_interest"] = get_binance_open_interest()
+    market_data["futures_data"] = get_bybit_funding()
     market_data["timestamp"] = str(datetime.now())
     return market_data
 
@@ -133,7 +136,7 @@ def analyze_with_claude(market_data, contexto_extra=""):
 
 Analizá los siguientes datos REALES del mercado y decidí si hay una señal clara de LONG o SHORT.
 
-DATOS DEL MERCADO (Binance):
+DATOS DEL MERCADO (Bybit):
 {json.dumps(market_data, indent=2, ensure_ascii=False)}
 
 {f'CONTEXTO ADICIONAL: {contexto_extra}' if contexto_extra else ''}
@@ -227,7 +230,7 @@ def run_analysis(contexto_extra=""):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "BTC Signal Bot v4 corriendo", "time": str(datetime.now())})
+    return jsonify({"status": "BTC Signal Bot v5 (Bybit) corriendo", "time": str(datetime.now())})
 
 
 @app.route("/analyze")
@@ -266,6 +269,7 @@ def test_telegram():
 
 @app.route("/market-data")
 def market_data_endpoint():
+    """Ver los datos del mercado sin analizar (debug)"""
     data = collect_all_data()
     return jsonify(data)
 
