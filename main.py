@@ -131,4 +131,4 @@ def get_okx_funding():
         oi = d3["data"][0] if d3.get("code") == "0" and d3.get("data") else {}
 
         last_price = float(ticker["last"])
-        open_24h = float(ticker["open24
+        open_24h = float(ticker["open24h"])
