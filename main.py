@@ -113,18 +113,29 @@ def calculate_indicators(df):
 
 def get_okx_funding():
     try:
-        # Funding rate
         r1 = requests.get(f"https://www.okx.com/api/v5/public/funding-rate?instId={OKX_SYMBOL}", timeout=10)
         d1 = r1.json()
-        # Ticker (precio y volumen 24h)
         r2 = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={OKX_SYMBOL}", timeout=10)
         d2 = r2.json()
-        # Open interest
         r3 = requests.get(f"https://www.okx.com/api/v5/public/open-interest?instId={OKX_SYMBOL}", timeout=10)
         d3 = r3.json()
-
         if d1.get("code") != "0" or d2.get("code") != "0":
             return {"error": "API OKX error"}
+        funding = d1["data"][0]
+        ticker = d2["data"][0]
+        oi = d3["data"][0] if d3.get("code") == "0" and d3.get("data") else {}
+        last_price = float(ticker["last"])
+        open_24h = float(ticker["open24h"])
+        price_change_pct = ((last_price - open_24h) / open_24h * 100) if open_24h > 0 else 0
+        return {
+            "mark_price": last_price,
+            "funding_rate": float(funding["fundingRate"]) * 100,
+            "open_interest": float(oi.get("oi", 0)),
+            "volume_24h": float(ticker["vol24h"]),
+            "price_change_24h_pct": round(price_change_pct, 2)
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
         funding = d1["data"][0]
         ticker = d2["data"][0]
