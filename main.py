@@ -272,6 +272,16 @@ def market_data_endpoint():
     data = collect_all_data()
     return jsonify(data)
 
-
+@app.route("/debug-bybit")
+def debug_bybit():
+    """Ver qué responde Bybit crudo al servidor"""
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", timeout=10)
+        return jsonify({
+            "status_code": r.status_code,
+            "primeros_500_chars": r.text[:500]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
