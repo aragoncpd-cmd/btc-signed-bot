@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import requests, os, json
 from datetime import datetime
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 
 app = Flask(__name__)
 
@@ -10,21 +10,31 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 
-# Mapeo de temporalidades a formato Bybit
-TIMEFRAMES = {
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "4h": "240",
-    "1d": "D"
-}
-
+TIMEFRAMES = {"5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
 UMBRAL_CONFIANZA = 70
 
 
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def rsi(series, length=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def macd_calc(series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    return macd_line, signal_line
+
+
 def get_bybit_klines(interval, limit=200):
-    """Pide velas de Bybit para BTCUSDT perpetual"""
     url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval={interval}&limit={limit}"
     try:
         r = requests.get(url, timeout=10)
@@ -32,11 +42,8 @@ def get_bybit_klines(interval, limit=200):
         if data.get("retCode") != 0:
             return None
         klines = data["result"]["list"]
-        # Bybit devuelve las velas en orden inverso (más reciente primero)
         klines.reverse()
-        df = pd.DataFrame(klines, columns=[
-            "open_time", "open", "high", "low", "close", "volume", "turnover"
-        ])
+        df = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
         df["close"] = df["close"].astype(float)
         df["high"] = df["high"].astype(float)
         df["low"] = df["low"].astype(float)
@@ -50,14 +57,11 @@ def calculate_indicators(df):
     if df is None or len(df) < 50:
         return None
 
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    df["ema_20"] = ta.ema(df["close"], length=20)
-    df["ema_50"] = ta.ema(df["close"], length=50)
-    df["ema_200"] = ta.ema(df["close"], length=200)
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    if macd is not None:
-        df["macd"] = macd["MACD_12_26_9"]
-        df["macd_signal"] = macd["MACDs_12_26_9"]
+    df["rsi"] = rsi(df["close"], length=14)
+    df["ema_20"] = ema(df["close"], length=20)
+    df["ema_50"] = ema(df["close"], length=50)
+    df["ema_200"] = ema(df["close"], length=200)
+    df["macd"], df["macd_signal"] = macd_calc(df["close"])
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -73,7 +77,7 @@ def calculate_indicators(df):
     else:
         ema_trend = "lateral"
 
-    if pd.notna(last.get("macd")) and pd.notna(last.get("macd_signal")):
+    if pd.notna(last["macd"]) and pd.notna(last["macd_signal"]):
         if last["macd"] > last["macd_signal"] and prev["macd"] <= prev["macd_signal"]:
             macd_state = "cruce_alcista_reciente"
         elif last["macd"] < last["macd_signal"] and prev["macd"] >= prev["macd_signal"]:
@@ -101,7 +105,6 @@ def calculate_indicators(df):
 
 
 def get_bybit_funding():
-    """Pide funding rate de Bybit Futures"""
     try:
         r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", timeout=10)
         data = r.json()
@@ -255,11 +258,7 @@ def test_telegram():
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": "🧪 Test desde el servidor — Telegram funciona correctamente",
-                "parse_mode": "Markdown"
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": "🧪 Test desde el servidor — Telegram funciona correctamente", "parse_mode": "Markdown"},
             timeout=10
         )
         return jsonify({"status": "ok", "telegram": r.json()})
