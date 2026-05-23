@@ -195,23 +195,23 @@ def send_telegram(signal, contexto=""):
     if signal.get("señal") == "NEUTRAL" or signal.get("confianza", 0) < UMBRAL_CONFIANZA:
         return {"sent": False, "reason": f"Señal {signal.get('señal')} con confianza {signal.get('confianza')}%"}
     emoji = "🟢" if signal["señal"] == "LONG" else "🔴"
-    msg = f"""{emoji} *SEÑAL BTC/USDT — {signal['señal']}*
+    msg = f"""{emoji} SEÑAL BTC/USDT — {signal['señal']}
 
-💰 Entrada: `{signal.get('entrada', 'N/A')}`
-🎯 TP1: `{signal.get('tp1', 'N/A')}`
-🎯 TP2: `{signal.get('tp2', 'N/A')}`
-🛑 SL: `{signal.get('sl', 'N/A')}`
-⚡ Apalancamiento: `{signal.get('apalancamiento', 'N/A')}x`
-📊 Confianza: `{signal.get('confianza')}%`
+💰 Entrada: {signal.get('entrada', 'N/A')}
+🎯 TP1: {signal.get('tp1', 'N/A')}
+🎯 TP2: {signal.get('tp2', 'N/A')}
+🛑 SL: {signal.get('sl', 'N/A')}
+⚡ Apalancamiento: {signal.get('apalancamiento', 'N/A')}x
+📊 Confianza: {signal.get('confianza')}%
 
 📝 {signal.get('razon', '')}
 {f'{chr(10)}🔔 Trigger: {contexto}' if contexto else ''}
 
-⚠️ _Gestioná siempre tu riesgo._"""
+⚠️ Gestioná siempre tu riesgo."""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=10
         )
         return {"sent": True, "telegram": r.json()}
