@@ -35,6 +35,37 @@ def macd_calc(series, fast=12, slow=26, signal=9):
     return macd_line, signal_line
 
 
+def calcular_atr(df, length=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    return atr.iloc[-1]
+
+
+def calcular_soportes_resistencias(df, ventana=5, max_niveles=3):
+    highs = df["high"].values
+    lows = df["low"].values
+    precio_actual = df["close"].iloc[-1]
+    resistencias = []
+    soportes = []
+    for i in range(ventana, len(df) - ventana):
+        es_max = all(highs[i] >= highs[i-j] for j in range(1, ventana+1)) and all(highs[i] >= highs[i+j] for j in range(1, ventana+1))
+        es_min = all(lows[i] <= lows[i-j] for j in range(1, ventana+1)) and all(lows[i] <= lows[i+j] for j in range(1, ventana+1))
+        if es_max:
+            resistencias.append(round(highs[i], 2))
+        if es_min:
+            soportes.append(round(lows[i], 2))
+    resistencias = sorted([r for r in set(resistencias) if r > precio_actual])[:max_niveles]
+    soportes = sorted([s for s in set(soportes) if s < precio_actual], reverse=True)[:max_niveles]
+    return {"soportes": soportes, "resistencias": resistencias}
+
+
 def get_okx_klines(interval, limit=200):
     url = f"https://www.okx.com/api/v5/market/candles?instId={OKX_SYMBOL}&bar={interval}&limit={limit}"
     try:
@@ -87,6 +118,8 @@ def calculate_indicators(df):
         macd_state = "n/d"
     avg_volume = df["volume"].tail(20).mean()
     vol_relative = last["volume"] / avg_volume if avg_volume > 0 else 1
+    atr_valor = calcular_atr(df)
+    niveles = calcular_soportes_resistencias(df)
     return {
         "precio": round(last["close"], 2),
         "rsi": round(last["rsi"], 2) if pd.notna(last["rsi"]) else None,
@@ -95,7 +128,9 @@ def calculate_indicators(df):
         "ema_200": round(last["ema_200"], 2) if pd.notna(last["ema_200"]) else None,
         "ema_trend": ema_trend,
         "macd_state": macd_state,
-        "volumen_relativo": round(vol_relative, 2)
+        "volumen_relativo": round(vol_relative, 2),
+        "atr": round(atr_valor, 2) if pd.notna(atr_valor) else None,
+        "soportes_resistencias": niveles
     }
 
 
@@ -162,6 +197,12 @@ SHORT cuando hay confluencia de:
 - Funding muy positivo (> 0.05%)
 - Volumen relativo > 1
 
+GESTIÓN DE NIVELES (importante):
+- Usá el ATR de cada temporalidad para dimensionar el SL: un SL razonable está a 1.5x ATR de la entrada aprox.
+- Mirá los soportes_resistencias: NO pongas un SHORT justo encima de un soporte fuerte, ni un LONG justo debajo de una resistencia fuerte.
+- Ubicá los TP cerca de soportes (para SHORT) o resistencias (para LONG) reales.
+- El ratio riesgo:beneficio debe ser MÍNIMO 1:2 (la distancia a TP1 debe ser al menos el doble que la distancia al SL). Si no se cumple, devolvé NEUTRAL.
+
 NEUTRAL cuando no hay confluencia clara.
 
 Respondé SOLO con este JSON exacto:
@@ -173,7 +214,7 @@ Respondé SOLO con este JSON exacto:
   "tp2": "precio",
   "sl": "precio",
   "apalancamiento": número entre 2 y 10,
-  "razon": "explicación breve de la confluencia detectada"
+  "razon": "explicación breve de la confluencia detectada, mencionando soportes/resistencias y ratio R:B"
 }}"""
     try:
         response = requests.post(
@@ -228,7 +269,7 @@ def run_analysis(contexto_extra=""):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "BTC Signal Bot v7 (OKX) corriendo", "time": str(datetime.now())})
+    return jsonify({"status": "BTC Signal Bot v8 (OKX + ATR/SR) corriendo", "time": str(datetime.now())})
 
 
 @app.route("/analyze")
@@ -253,7 +294,7 @@ def test_telegram():
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": "🧪 Test desde el servidor — Telegram funciona correctamente", "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": "🧪 Test desde el servidor — Telegram funciona correctamente"},
             timeout=10
         )
         return jsonify({"status": "ok", "telegram": r.json()})
@@ -265,15 +306,6 @@ def test_telegram():
 def market_data_endpoint():
     data = collect_all_data()
     return jsonify(data)
-
-
-@app.route("/debug-okx")
-def debug_okx():
-    try:
-        r = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={OKX_SYMBOL}", timeout=10)
-        return jsonify({"status_code": r.status_code, "primeros_500_chars": r.text[:500]})
-    except Exception as e:
-        return jsonify({"error": str(e)})
 
 
 if __name__ == "__main__":
