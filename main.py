@@ -230,7 +230,7 @@ def run_analysis(contexto_extra=""):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "BTC Signal Bot v5 (Bybit) corriendo", "time": str(datetime.now())})
+    return jsonify({"status": "BTC Signal Bot v6 (Bybit) corriendo", "time": str(datetime.now())})
 
 
 @app.route("/analyze")
