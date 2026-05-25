@@ -307,6 +307,16 @@ def market_data_endpoint():
     data = collect_all_data()
     return jsonify(data)
 
-
+@app.route("/debug-token")
+def debug_token():
+    t = TELEGRAM_TOKEN or ""
+    return jsonify({
+        "largo": len(t),
+        "primeros_4": t[:4],
+        "ultimos_4": t[-4:],
+        "tiene_espacios": t != t.strip(),
+        "chat_id": TELEGRAM_CHAT_ID
+    })
+    
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
